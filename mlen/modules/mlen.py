@@ -120,3 +120,22 @@ class MLEN(LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
+
+    def _grad_norm(self, module):
+        return torch.norm(
+            torch.stack([
+                p.grad.detach().norm(2)
+                for p in module.parameters()
+                if p.grad is not None
+            ]),
+            2,
+        )
+
+    def on_before_optimizer_step(self, optimizer):
+        total_norm = self._grad_norm(self)
+        self.log("train/grad_norm", total_norm, on_step=True)
+        linear_norm = self._grad_norm(self.model.linear)
+        self.log("train/linear_grad_norm", linear_norm, on_step=True)
+        if self.model.cond:
+            cond_norm = self._grad_norm(self.model.cond_proj)
+            self.log("train/cond_grad_norm", cond_norm, on_step=True)
