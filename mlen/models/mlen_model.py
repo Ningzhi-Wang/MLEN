@@ -143,9 +143,9 @@ class MLENModel(MuQModel):
         return cond_loss
 
 
-    def forward(self, x, *args, attention_mask=None, label=None, cond_label=None):
+    def forward(self, x, *args, attention_mask=None, label=None, cond_label=None, feature_only=False):
         # get target feature tokens
-        if self.training:
+        if self.training or not feature_only:
             target_tokens, melspec = self.get_targets(x, label=label) 
             # masking
             x, masked_indices = self.masking(x, attention_mask=attention_mask) 
@@ -155,7 +155,7 @@ class MLENModel(MuQModel):
         # forward
         logits, hidden_emb, masked_indices = self.get_predictions(x, *args, mask=masked_indices, attention_mask=attention_mask, return_new_mask=True) 
         
-        if not self.training:
+        if not self.training or feature_only:
             return logits, hidden_emb
 
         # get loss

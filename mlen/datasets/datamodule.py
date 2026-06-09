@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from pytorch_lightning import LightningDataModule
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, random_split
 
 from .datasets import AudioTextRVQDataset
 
@@ -263,8 +263,13 @@ class MLENDataModule(LightningDataModule):
         single_target: bool = False,
         return_net_input: bool = False,
         warn_on_label_length_mismatch: bool = True,
+        val_split_fraction: float = 0.0,
+        val_split_seed: int = 0,
     ):
         super().__init__()
+        if not 0.0 <= val_split_fraction < 1.0:
+            raise ValueError("val_split_fraction must be in the range [0.0, 1.0).")
+
         self.root_path = root_path
         self.meta_paths = {
             "train": train_meta_path,
@@ -283,6 +288,8 @@ class MLENDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
         self.drop_last = drop_last
+        self.val_split_fraction = val_split_fraction
+        self.val_split_seed = val_split_seed
 
         self.dataset_kwargs = {
             "sample_rate": sample_rate,
@@ -341,18 +348,46 @@ class MLENDataModule(LightningDataModule):
             **self.dataset_kwargs,
         )
 
+    def _fit_datasets(self) -> tuple[Optional[Dataset], Optional[Dataset]]:
+        train_dataset = self._make_dataset("train")
+        if train_dataset is None:
+            return None, None
+
+        if self.meta_paths["val"] is not None:
+            return train_dataset, self._make_dataset("val")
+
+        if self.val_split_fraction == 0.0:
+            return train_dataset, None
+
+        val_size = int(len(train_dataset) * self.val_split_fraction)
+        if val_size == 0:
+            val_size = 1
+        train_size = len(train_dataset) - val_size
+        if train_size <= 0:
+            raise ValueError(
+                "val_split_fraction leaves no samples for training. "
+                "Use a smaller fraction or provide an explicit val_meta_path."
+            )
+
+        generator = torch.Generator().manual_seed(self.val_split_seed)
+        train_subset, val_subset = random_split(
+            train_dataset,
+            [train_size, val_size],
+            generator=generator,
+        )
+        return train_subset, val_subset
+
     def setup(self, stage: Optional[str] = None):
         if stage in (None, "fit"):
-            self.train_dataset = self._make_dataset("train")
-            self.val_dataset = self._make_dataset("val")
+            self.train_dataset, self.val_dataset = self._fit_datasets()
         if stage in (None, "validate"):
-            self.val_dataset = self._make_dataset("val")
+            _, self.val_dataset = self._fit_datasets()
         if stage in (None, "test"):
             self.test_dataset = self._make_dataset("test")
 
     def _loader(
         self,
-        dataset: Optional[AudioTextRVQDataset],
+        dataset: Optional[Dataset],
         *,
         batch_size: int,
         shuffle: bool,

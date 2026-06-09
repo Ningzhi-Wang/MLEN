@@ -72,10 +72,10 @@ class MLEN(LightningModule):
         self.cond_loss_weight = config.cond_loss_weight 
         self.flash_attention = config.flash_attention
 
-    def forward(self, x, *args, padding_mask=None, label=None, cond_label=None):
+    def forward(self, x, *args, padding_mask=None, label=None, cond_label=None, feature_only=False):
         attention_mask = None if padding_mask is None else ~padding_mask.bool()
         return self.model(
-            x, *args, attention_mask=attention_mask, label=label, cond_label=cond_label
+            x, *args, attention_mask=attention_mask, label=label, cond_label=cond_label, feature_only=feature_only
         )
 
     def extract_features(self, x, *args, padding_mask=None, ret_layer=True, **kwargs):
@@ -111,6 +111,23 @@ class MLEN(LightningModule):
             self.log(f"train/{name}", value, on_step=True, on_epoch=True)
         for name, value in accuracies.items():
             self.log(f"train/{name}_acc", value, on_step=True, on_epoch=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x = batch['source']
+        cond = batch.get('aspect_cond', None)
+        padding_mask = batch.get('padding_mask', None)
+        label = batch.get('target', None)
+        cond_label = batch.get('aspect_target', None)
+        logits, hidden_emb, losses, accuracies = self(x, cond, padding_mask=padding_mask, label=label, cond_label=cond_label, feature_only=False)
+        if 'cond_loss' in losses:
+            losses['cond_loss'] *= self.cond_loss_weight
+        loss = sum(losses.values())
+        for name, value in losses.items():
+            self.log(f"valid/{name}", value, on_step=True, on_epoch=True)
+        for name, value in accuracies.items():
+            self.log(f"valid/{name}_acc", value, on_step=True, on_epoch=True)
 
         return loss
 
