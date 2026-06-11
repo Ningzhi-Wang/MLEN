@@ -1,9 +1,11 @@
 import torch 
 import numpy as np
 
-from pytorch_lightning import LightningModule
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from pytorch_lightning import LightningModule
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
 from ..models import MLENModel
 
@@ -132,11 +134,39 @@ class MLEN(LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = min(self.hparams.warmup_steps, max(total_steps - 1, 1))
+        decay_steps = max(total_steps - warmup_steps, 1)
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
+        warm_up = LinearLR(
+            optimizer,
+            start_factor=0.0,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        decay = LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=0.01,
+            total_iters=decay_steps,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warm_up, decay],
+            milestones=[warmup_steps],
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def _grad_norm(self, module):
         return torch.norm(

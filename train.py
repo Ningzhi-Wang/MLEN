@@ -10,7 +10,7 @@ from typing import Optional
 from dataclasses import asdict, fields
 from muq import MuQ
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from mlen.modules import MLEN, MLENConfig
 from mlen.datasets import MLENDatamodule
@@ -124,6 +124,7 @@ def main():
         every_n_train_steps=1000,       
         save_on_train_epoch_end=True,
     )
+    lr_monitor = LearningRateMonitor(logging_interval="step")
     trainer = pl.Trainer(
         default_root_dir=str(log_path),
         max_epochs=1000,
@@ -133,7 +134,8 @@ def main():
         accumulate_grad_batches=15,
         log_every_n_steps=10,
         logger=wandb_logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, lr_monitor],
+        val_check_interval=500,
     )
     trainer.fit(mlen, datamodule)
 

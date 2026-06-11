@@ -2,6 +2,7 @@ import torch
 from einops import rearrange
 from easydict import EasyDict
 from torch import nn
+from torch.nn import functional as F
 
 from .conformer import CondConformerEncoder
 from muq.muq.models.muq_model import MuQModel
@@ -139,7 +140,8 @@ class MLENModel(MuQModel):
 
     def get_cond_loss(self, last_hidden_emb, cond_target):
         cond_pred = self.cond_proj(last_hidden_emb).mean(dim=1)
-        cond_loss = self.cond_loss(cond_pred, cond_target)
+        normalized_pred = F.normalize(cond_pred, p=2, dim=-1)
+        cond_loss = self.cond_loss(normalized_pred, cond_target)
         return cond_loss
 
 
@@ -155,7 +157,7 @@ class MLENModel(MuQModel):
         # forward
         logits, hidden_emb, masked_indices = self.get_predictions(x, *args, mask=masked_indices, attention_mask=attention_mask, return_new_mask=True) 
         
-        if not self.training or feature_only:
+        if not self.training and feature_only:
             return logits, hidden_emb
 
         # get loss
