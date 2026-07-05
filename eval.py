@@ -17,6 +17,7 @@ import torch, librosa
 import pytorch_lightning as pl
 from tqdm.notebook import tqdm
 from torch.nn import functional as F
+from torch.serialization import safe_globals
 from muq import MuQMuLan, MuQ
 from mlen.modules import MLEN, MLENConfig
 from mlen.models import MLENModel
@@ -40,6 +41,17 @@ TASK_PATH = {
     "Harmonixset": "c4dm-datasets/Harmonixset/",
 }
 
+CONDS = torch.eye(8).float()
+TASK_CONDS_IDX = {
+    "MTT": 0,
+    "GTZAN": 0,
+    "EMO": 7,
+    "Giantsteps": 1,
+    "NSynthPitch": 1,
+    "NSynthTimbre": 6,
+    "VocalSetSinger": 3,
+    "VocalSetTechnique": 3,
+}
 
 def get_logger(save_dir: str, run_name: Optional[str] = None) -> WandbLogger:
     save_path = Path(save_dir)
@@ -62,13 +74,17 @@ def cast_dataclass(obj, target_cls):
     })
 
 
-def load_muq_weights(muq, mlen):
+def load_muq_weights(muq, mlen, load_loss_head=True):
     src = muq.model.state_dict()      # no "model." prefix
     dst = mlen.model.state_dict()
     loadable = {}
     skipped = []
 
     for k, v in src.items():
+        if not load_loss_head and k in {"linear.weight", "linear.bias"}:
+            skipped.append(k)
+            continue
+
         is_replaced_adaln = (
             k.startswith("conformer.layers.")
             and ".self_attn_layer_norm." in k
@@ -90,8 +106,8 @@ def load_muq_weights(muq, mlen):
 
         if k in dst and dst[k].shape == v.shape:
             loadable[k] = v
-        else:
-            raise ValueError(f"Unexpected key {k} with shape {v.shape} not found in destination model.")
+        # else:
+        #     raise ValueError(f"Unexpected key {k} with shape {v.shape} not found in destination model.")
 
     missing, unexpected = mlen.model.load_state_dict(loadable, strict=False)
     return mlen, missing, unexpected, skipped
@@ -111,27 +127,34 @@ def get_pretrained_mlen():
     return mlen
 
 
+def load_mlen_checkpoint(ckpt):
+    with safe_globals([MLENConfig]):
+        return MLEN.load_from_checkpoint(ckpt, strict=True)
+
+
 def evaluate(config, ckpt):
     task_names = config["task_names"]
+    conditional = config.get("conditional", False)
 
     # Download checkpoint from S3 if not present locally
     save_dir  = config['trainer']['path']
-    # if not os.path.isfile(ckpt):
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     aws_key = os.environ.get("AWS_ACCESS_KEY_C4DM02")
-    #     aws_secret = os.environ.get("AWS_SECRET_KEY_C4DM02")
-    #     s3 = boto3.client(
-    #         "s3",
-    #         endpoint_url="https://ceph-private-object-rgw.comp-research.qmul.ac.uk",
-    #         aws_access_key_id=aws_key,
-    #         aws_secret_access_key=aws_secret,
-    #     )
-    #     s3.download_file(
-    #         Bucket="c4dm-02",
-    #         Key=ckpt,
-    #         Filename=os.path.join(save_dir, "checkpoint.ckpt"),
-    #     )
-    #     ckpt = os.path.join(save_dir, "checkpoint.ckpt")
+    if isinstance(ckpt, str) and not os.path.isfile(ckpt):
+        os.makedirs(save_dir, exist_ok=True)
+        aws_key = os.environ.get("AWS_ACCESS_KEY_C4DM02")
+        aws_secret = os.environ.get("AWS_SECRET_KEY_C4DM02")
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="https://ceph-private-object-rgw.comp-research.qmul.ac.uk",
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret,
+        )
+        s3.download_file(
+            Bucket="c4dm-02",
+            Key=ckpt,
+            Filename=os.path.join(save_dir, "checkpoint.ckpt"),
+        )
+        ckpt = os.path.join(save_dir, "checkpoint.ckpt")
+        
 
     # Perform hyperparameter search as in MERT
     lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
@@ -141,12 +164,11 @@ def evaluate(config, ckpt):
     l2s = [0]
     layers = list(range(config['model']['input_channel']))
     layers.append("all")
-    # layers = ["all"]
 
     train_sizes = [-1]
 
     settings = list(product(lrs, batch_size, drop_outs, l2s, layers))
-    encoder = get_pretrained_mlen()
+    encoder = get_pretrained_mlen() if ckpt is None else load_mlen_checkpoint(ckpt)
     encoder.eval()
 
     config["trainer"].pop("epochs", None)
@@ -157,15 +179,15 @@ def evaluate(config, ckpt):
         for train_size in train_sizes:
             results = {}
             task_config = config.copy()
-            task = eval(f"tasks.{task_name}")(TASK_PATH[task_name], **task_config["task"])
+            task = eval(f"tasks.{task_name}")(TASK_PATH[task_name], encoder, **task_config["task"])
+            if conditional:
+                task.set_conditional(CONDS[TASK_CONDS_IDX[task_name]])
             model_param = task_config["model"]
-            model_param["encoder"] = encoder
             trainer_param = task_config["trainer"]
             trainer_param["default_root_dir"] = root_path
             trainer_param["precision"] = "bf16-mixed"
             data_param = task_config["data"]
             data_param["trainset_size"] = train_size
-            data_param['encoder'] = encoder
             # datamodule = LatentModule(**data_param)
             datamodule = task.dataset(**data_param)
             datamodule.setup("fit")
