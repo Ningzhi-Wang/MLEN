@@ -11,6 +11,7 @@ from dataclasses import asdict, fields
 from muq import MuQ
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.strategies import DDPStrategy
 
 from mlen.modules import MLEN, MLENConfig
 from mlen.datasets import MLENDatamodule
@@ -36,13 +37,17 @@ def cast_dataclass(obj, target_cls):
         if k in target_fields
     })
 
-def load_muq_weights(muq, mlen):
+def load_muq_weights(muq, mlen, load_loss_head=True):
     src = muq.model.state_dict()      # no "model." prefix
     dst = mlen.model.state_dict()
     loadable = {}
     skipped = []
 
     for k, v in src.items():
+        if not load_loss_head and k in {"linear.weight", "linear.bias"}:
+            skipped.append(k)
+            continue
+
         is_replaced_adaln = (
             k.startswith("conformer.layers.")
             and ".self_attn_layer_norm." in k
@@ -64,11 +69,21 @@ def load_muq_weights(muq, mlen):
 
         if k in dst and dst[k].shape == v.shape:
             loadable[k] = v
-        else:
-            raise ValueError(f"Unexpected key {k} with shape {v.shape} not found in destination model.")
+        # else:
+        #     raise ValueError(f"Unexpected key {k} with shape {v.shape} not found in destination model.")
 
     missing, unexpected = mlen.model.load_state_dict(loadable, strict=False)
     return mlen, missing, unexpected, skipped
+
+
+def freeze_unused_parameters(mlen):
+    for name, p in mlen.named_parameters():
+        if (
+            name == "model.cls_token" or name.startswith("model.rvq.")
+        ):
+            p.requires_grad = False
+    return mlen
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -80,6 +95,9 @@ def main():
     parser.add_argument("--val_split_fraction", dest="val_split_fraction", type=float, default=0.0)
     parser.add_argument("--val_split_seed", dest="val_split_seed", type=int, default=1234)
     args = parser.parse_args()
+
+    os.environ.setdefault("MASTER_PORT", "29501")
+    train_name = os.environ.get("TRAIN_NAME", "test-run")
  
     script_dir = Path(__file__).resolve().parent
     meta_path = Path(args.meta_path) or script_dir / "meta"
@@ -90,10 +108,20 @@ def main():
     config = muq.config
     config = cast_dataclass(config, MLENConfig)
     config.cond_target_dim = 512
+    config.cond_loss_weight = 10.
+    config.rvq_loss_weight = 1.
     config.cond_dim = 8
     config.flash_attention = False
-    mlen = MLEN(config,lr=1e-5, weight_decay=0.01)
-    mlen, missing, unexpected, skipped = load_muq_weights(muq, mlen)
+    config.target_geometry_path = str(
+        meta_path / "target_geometry.pt"
+    )
+    mlen = MLEN(config, lr=1e-5, weight_decay=0.01, warmup_steps=200)
+    mlen, missing, unexpected, skipped = load_muq_weights(
+        muq,
+        mlen,
+        load_loss_head=True,
+    )
+    mlen = freeze_unused_parameters(mlen)
     print(f"Loaded weights with {len(missing)} missing keys, {len(unexpected)} unexpected keys, and {len(skipped)} skipped keys.")
     datamodule = MLENDatamodule(
         root_path=data_path,
@@ -108,7 +136,7 @@ def main():
             str(meta_path / "melrvq_label.codebook6.txt"),
             str(meta_path / "melrvq_label.codebook7.txt"),
         ],
-        batch_size=8,
+        batch_size=4,
         pad_audio=True,
         fixed_sample_size=True,
         warn_on_label_length_mismatch=False,
@@ -116,22 +144,26 @@ def main():
         val_split_seed=args.val_split_seed,
     )
     datamodule.setup('fit')
-    wandb_logger = get_logger(str(log_path / "logs"), f"test_run")
+    wandb_logger = get_logger(str(log_path / "logs"), train_name)
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(log_path / "checkpoints"),
-        filename="epoch-{epoch:04d}",
+        filename="epoch={epoch:04d}-step={step:08d}",
+        auto_insert_metric_name=False,
         save_top_k=-1,          # keep all checkpoints
-        every_n_train_steps=1000,       
+        every_n_train_steps=500,       
         save_on_train_epoch_end=True,
+        save_last=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     trainer = pl.Trainer(
         default_root_dir=str(log_path),
-        max_epochs=1000,
+        max_epochs=1,
         accelerator="cuda",
         precision='bf16-mixed',
         devices='auto',
-        accumulate_grad_batches=15,
+        # strategy=DDPStrategy(find_unused_parameters=False),
+        strategy="auto",
+        accumulate_grad_batches=16,
         log_every_n_steps=10,
         logger=wandb_logger,
         callbacks=[checkpoint_callback, lr_monitor],
