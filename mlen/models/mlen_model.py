@@ -3,9 +3,10 @@ from einops import rearrange
 from easydict import EasyDict
 from torch import nn
 from torch.nn import functional as F
+from muq.muq.models.muq_model import MuQModel
 
 from .conformer import CondConformerEncoder
-from muq.muq.models.muq_model import MuQModel
+from .utils import multi_positive_infonce
 
 class MLENModel(MuQModel):
     def __init__(
@@ -21,8 +22,14 @@ class MLENModel(MuQModel):
         config.hidden_size = kwargs.get("encoder_dim", 1024)
         if cond_dim is not None:
             self.cond = True
-            self.cond_proj = nn.Linear(kwargs["encoder_dim"], cond_target_dim)
-            self.cond_loss = nn.MSELoss()
+            self.cond_proj = nn.Sequential(
+                nn.Linear(kwargs["encoder_dim"], cond_target_dim),
+                # nn.GELU(),
+                # nn.Linear(cond_target_dim, cond_target_dim)
+            )
+            # self.cond_loss = nn.MSELoss()
+            # self.cond_loss = lambda x, y: 1 - (x * y).sum(dim=-1).mean()
+            self.cond_loss = multi_positive_infonce
             config.cond_dim = cond_dim
             config.flash_attention = flash_attention
             self.conformer = CondConformerEncoder(config)
@@ -137,13 +144,20 @@ class MLENModel(MuQModel):
                 / masked_tokens.numel()
             )
         return losses, accuracies
+    
+    def get_cond_prediction(self, last_hiddent_emb, attention_mask):
+        if attention_mask is not None:
+            attention_mask = attention_mask.bool()
+            skip_n = int(attention_mask.size(-1) / last_hiddent_emb.size(1))
+            attention_mask = attention_mask[:, ::skip_n]
+            attention_mask = attention_mask[:, :last_hiddent_emb.size(1)]
 
-    def get_cond_loss(self, last_hidden_emb, cond_target):
-        cond_pred = self.cond_proj(last_hidden_emb).mean(dim=1)
-        normalized_pred = F.normalize(cond_pred, p=2, dim=-1)
-        cond_loss = self.cond_loss(normalized_pred, cond_target)
-        return cond_loss
-
+            frame_mask = attention_mask.unsqueeze(-1).float()
+            cond_pred = self.cond_proj(last_hiddent_emb)
+            cond_pred = (cond_pred * frame_mask).sum(dim=1) / frame_mask.sum(dim=1).clamp_min(1.0)
+        else:
+            cond_pred = self.cond_proj(last_hiddent_emb).mean(dim=1)
+        return F.normalize(cond_pred, p=2, dim=-1)
 
     def forward(self, x, *args, attention_mask=None, label=None, cond_label=None, feature_only=False):
         # get target feature tokens
@@ -168,7 +182,8 @@ class MLENModel(MuQModel):
         
         if self.cond:
             assert cond_label is not None, "cond_label is required for MLENModel in conditional mode"
-            losses['cond_loss'] = self.get_cond_loss(hidden_emb[-1], cond_label)
+            cond_pred = self.get_cond_prediction(hidden_emb[-1], attention_mask)
+            losses['cond_loss'] = self.cond_loss(cond_pred, cond_label)
 
         return logits, hidden_emb, losses, accuracies
 
