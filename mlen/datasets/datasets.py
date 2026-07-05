@@ -46,34 +46,38 @@ class AudioTextRVQDataset(Dataset):
         self.label_processors = label_processors
 
         self.num_labels = len(label_paths)
-        self.label_rates = (
-            [label_rates for _ in range(len(label_paths))]
-            if isinstance(label_rates, (float, int))
-            else label_rates
-        )
-        self.label_codebook_counts = (
-            [label_codebook_counts for _ in range(len(label_paths))]
-            if isinstance(label_codebook_counts, int)
-            else label_codebook_counts
-        )
-        logger.info('preparing labels')
-        self.label_paths = label_paths
-        self.label_offsets_list = [
-            load_label_offset(p, inds, tot) for p in label_paths
-        ]
-        if warn_on_label_length_mismatch:
-            for label_path, label_rate, label_codebook_count in zip(
-                label_paths, self.label_rates, self.label_codebook_counts
-            ):
-                verify_label_lengths(
-                    self.sizes,
-                    self.sample_rate,
-                    label_path,
-                    label_rate,
-                    inds,
-                    tot,
-                    label_codebook_count=label_codebook_count,
-                )
+        if self.num_labels > 0:
+            self.label_prepared = True
+            self.label_rates = (
+                [label_rates for _ in range(len(label_paths))]
+                if isinstance(label_rates, (float, int))
+                else label_rates
+            )
+            self.label_codebook_counts = (
+                [label_codebook_counts for _ in range(len(label_paths))]
+                if isinstance(label_codebook_counts, int)
+                else label_codebook_counts
+            )
+            logger.info('preparing labels')
+            self.label_paths = label_paths
+            self.label_offsets_list = [
+                load_label_offset(p, inds, tot) for p in label_paths
+            ]
+            if warn_on_label_length_mismatch:
+                for label_path, label_rate, label_codebook_count in zip(
+                    label_paths, self.label_rates, self.label_codebook_counts
+                ):
+                    verify_label_lengths(
+                        self.sizes,
+                        self.sample_rate,
+                        label_path,
+                        label_rate,
+                        inds,
+                        tot,
+                        label_codebook_count=label_codebook_count,
+                    )
+        else:
+            self.label_prepared = False
         logger.info(
             f"crop_and_pad_to_maximum={self.crop_and_pad_to_maximum}, "
             f"max_sample_size={self.max_sample_size}"
@@ -87,13 +91,16 @@ class AudioTextRVQDataset(Dataset):
         while item is None:
             try:
                 track = self.valid_tracks[index]
+                # aspect_idx = np.random.choice([0, 1, 1, 2, 3, 4, 5, 6, 7])
                 aspect_idx = torch.randint(0, len(track['aspect_indices']), (1,)).item()
                 wav = self.get_audio(track['track_name'])
-                labels = self.get_labels(index)
                 aspect_cond = self.aspect_embedding_table[track['aspect_indices'][aspect_idx]]
                 aspect_target = self.text_embedding_table[track['text_indices'][aspect_idx]]
-                item = {"id": index, "source": wav, "label_list": labels, "aspect_cond": aspect_cond, "aspect_target": aspect_target}
+                item = {"id": index, "source": wav, "aspect_cond": aspect_cond, "aspect_target": aspect_target}
+                if self.label_prepared:
+                    item["label_list"] = self.get_labels(index)
             except Exception as e:
+                raise e
                 print(f'skip damaged data {index}')
                 index = np.random.randint(len(self.sizes))
                 
