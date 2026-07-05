@@ -200,7 +200,7 @@ class CondConformerEncoder(nn.Module):
         else:
             self.embed_positions = None
 
-        self.pos_conv_embed = Wav2Vec2ConformerPositionalConvEmbedding(config)
+        # self.pos_conv_embed = Wav2Vec2ConformerPositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layers = nn.ModuleList(
