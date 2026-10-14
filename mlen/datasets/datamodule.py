@@ -5,9 +5,10 @@ from typing import Optional
 import torch
 from pytorch_lightning import LightningDataModule
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.nn.utils.rnn import pad_sequence
 
-from .datasets import AudioTextRVQDataset
+from .datasets import AspectDropoutView, AudioTextRVQDataset
 
 
 @dataclass
@@ -54,6 +55,8 @@ class AudioTextRVQCollator:
         if diff < 0:
             padding_mask[audio.numel():] = True
             return F.pad(audio, (0, -diff)), 0, padding_mask
+            # padded_audio = F.pad(audio, (0, -diff))
+            # return padded_audio, 0, padding_mask
 
         start = 0
         if self.random_crop:
@@ -104,6 +107,38 @@ class AudioTextRVQCollator:
             [self._as_label_tensor(sample["label_list"][label_idx]) for sample in samples]
             for label_idx in range(num_labels)
         ]
+
+    @staticmethod
+    def _collate_class_ids(samples):
+        class_id_rows = []
+
+        for sample in samples:
+            value = sample["aspect_class_id"]
+
+            if isinstance(value, torch.Tensor):
+                ids = value.detach().long().flatten()
+            else:
+                ids = torch.as_tensor(value, dtype=torch.long).flatten()
+
+            # Remove padding that might already exist in metadata.
+            ids = ids[ids >= 0]
+
+            if ids.numel() == 0:
+                raise ValueError(
+                    "The selected aspect has no valid class IDs"
+                )
+
+            # Avoid repeated positive classes.
+            ids = torch.unique(ids)
+            class_id_rows.append(ids)
+
+        padded_ids = pad_sequence(
+            class_id_rows,
+            batch_first=True,
+            padding_value=-1,
+        )
+
+        return padded_ids
 
     def _collate_frm_label(
         self,
@@ -188,6 +223,7 @@ class AudioTextRVQCollator:
         ]
         sources, starts, padding_masks = zip(*collated)
         targets_by_label = self._targets_by_label(samples)
+        # aspect_class_ids = self._collate_class_ids(samples)
 
         batch = {
             "id": torch.LongTensor([sample["id"] for sample in samples]),
@@ -196,6 +232,9 @@ class AudioTextRVQCollator:
             "audio_starts": torch.LongTensor(starts),
             "aspect_cond": torch.stack([sample["aspect_cond"] for sample in samples]),
             "aspect_target": torch.stack([sample["aspect_target"] for sample in samples]),
+            "text_index": torch.LongTensor([int(sample.get("text_index", -1)) for sample in samples]),
+            # "aspect_class_id": aspect_class_ids,
+            # "aspect_class_mask": aspect_class_ids.ne(-1),
         }
 
         if len(targets_by_label) > 0:
@@ -265,10 +304,14 @@ class MLENDataModule(LightningDataModule):
         warn_on_label_length_mismatch: bool = True,
         val_split_fraction: float = 0.0,
         val_split_seed: int = 0,
+        prefetch_factor: int = 2,
+        train_aspect_dropout: float = 0.0,
     ):
         super().__init__()
         if not 0.0 <= val_split_fraction < 1.0:
             raise ValueError("val_split_fraction must be in the range [0.0, 1.0).")
+        if not 0.0 <= train_aspect_dropout <= 1.0:
+            raise ValueError("train_aspect_dropout must be in the range [0.0, 1.0].")
 
         self.root_path = root_path
         self.meta_paths = {
@@ -287,9 +330,12 @@ class MLENDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.drop_last = drop_last
         self.val_split_fraction = val_split_fraction
         self.val_split_seed = val_split_seed
+        # Training only; validation and test never drop aspects.
+        self.train_aspect_dropout = train_aspect_dropout
 
         self.dataset_kwargs = {
             "sample_rate": sample_rate,
@@ -345,6 +391,7 @@ class MLENDataModule(LightningDataModule):
             root_path=self.root_path,
             meta_path=meta_path,
             label_paths=self.label_paths[split],
+            aspect_dropout=self.train_aspect_dropout if split == "train" else 0.0,
             **self.dataset_kwargs,
         )
 
@@ -375,6 +422,12 @@ class MLENDataModule(LightningDataModule):
             [train_size, val_size],
             generator=generator,
         )
+        # The split shares the training dataset's metadata and labels, so
+        # re-point the validation indices at a view without aspect dropout.
+        val_subset = Subset(
+            AspectDropoutView(train_dataset, aspect_dropout=0.0),
+            val_subset.indices,
+        )
         return train_subset, val_subset
 
     def setup(self, stage: Optional[str] = None):
@@ -396,20 +449,23 @@ class MLENDataModule(LightningDataModule):
     ) -> Optional[DataLoader]:
         if dataset is None:
             return None
-        persistent_workers = (
-            self.num_workers > 0
-            if self.persistent_workers is None
-            else self.persistent_workers
-        )
+        worker_options = {}
+        if self.num_workers > 0:
+            worker_options = {
+                "persistent_workers": (
+                    True if self.persistent_workers is None else self.persistent_workers
+                ),
+                "prefetch_factor": self.prefetch_factor,
+            }
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            persistent_workers=persistent_workers,
             drop_last=drop_last,
             collate_fn=collate_fn,
+            **worker_options,
         )
 
     def train_dataloader(self):
