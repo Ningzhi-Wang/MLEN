@@ -43,7 +43,7 @@ TASK_PATH = {
 
 CONDS = torch.eye(8).float()
 TASK_CONDS_IDX = {
-    "MTT": 0,
+    "MTT": [0, 1, 6],
     "GTZAN": 0,
     "EMO": 7,
     "Giantsteps": 1,
@@ -75,6 +75,7 @@ def cast_dataclass(obj, target_cls):
 
 
 def load_muq_weights(muq, mlen, load_loss_head=True):
+    """Load MuQ weights, remapping only keys replaced by conditional MLEN."""
     src = muq.model.state_dict()      # no "model." prefix
     dst = mlen.model.state_dict()
     loadable = {}
@@ -90,7 +91,9 @@ def load_muq_weights(muq, mlen, load_loss_head=True):
             and ".self_attn_layer_norm." in k
         )
 
-        if is_replaced_adaln:
+        # With cond_dim=None MLEN retains MuQ's standard LayerNorm, so the
+        # original key is already present and must not be remapped.
+        if k not in dst and is_replaced_adaln:
             if k.endswith(".weight"):
                 k = k.removesuffix(".weight") + ".gamma"
             elif k.endswith(".bias"):
@@ -99,9 +102,17 @@ def load_muq_weights(muq, mlen, load_loss_head=True):
                 skipped.append(k)
                 continue
 
-        if k == "conformer.pos_conv_embed.conv.parametrizations.weight.original0":
+        # CondConformer uses the legacy weight_g/weight_v representation,
+        # whereas the unconditioned MuQ Conformer keeps parametrizations.*
+        if (
+            k not in dst
+            and k == "conformer.pos_conv_embed.conv.parametrizations.weight.original0"
+        ):
             k = "conformer.pos_conv_embed.conv.weight_g"
-        elif k == "conformer.pos_conv_embed.conv.parametrizations.weight.original1":
+        elif (
+            k not in dst
+            and k == "conformer.pos_conv_embed.conv.parametrizations.weight.original1"
+        ):
             k = "conformer.pos_conv_embed.conv.weight_v"
 
         if k in dst and dst[k].shape == v.shape:
@@ -181,7 +192,9 @@ def evaluate(config, ckpt):
             task_config = config.copy()
             task = eval(f"tasks.{task_name}")(TASK_PATH[task_name], encoder, **task_config["task"])
             if conditional:
-                task.set_conditional(CONDS[TASK_CONDS_IDX[task_name]])
+                conds = torch.zeros(8).float()
+                conds[TASK_CONDS_IDX[task_name]] = 1
+                task.set_conditional(conds)
             model_param = task_config["model"]
             trainer_param = task_config["trainer"]
             trainer_param["default_root_dir"] = root_path
@@ -282,5 +295,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
