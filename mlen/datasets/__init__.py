@@ -1,2 +1,2 @@
 from .datamodule import MLENDatamodule
-from .datasets import AudioTextRVQDataset
+from .datasets import AspectDropoutView, AudioTextRVQDataset
