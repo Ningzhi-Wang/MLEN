@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from muq.muq.models.muq_model import MuQModel
 
 from .conformer import CondConformerEncoder
+from .pooling import AspectAttentionPool
 from .masking import mask_waveform
 from .utils import (
     multi_positive_infonce, 
@@ -46,6 +47,10 @@ PER_SAMPLE_COND_LOSSES = {
     "whitened_cosine_similarity_loss",
     "whitened_or_rvq_loss",
 }
+# Losses that give unconditional tracks (all-zero cond, aspect id -1) their
+# own term. Other losses never see such tracks in the pair format.
+UNCONDITIONAL_COND_LOSSES = {"whitened_or_rvq_loss"}
+COND_POOLINGS = ("mean", "cls", "attention")
 
 
 class MLENModel(MuQModel):
@@ -62,15 +67,16 @@ class MLENModel(MuQModel):
             aspect_whitening_matrices=None,
             cond_label_weights=None,
             cond_loss_kwargs=None,
+            cond_pool_heads=8,
             **kwargs
         ):
         super().__init__( **kwargs)
         config = EasyDict(kwargs.get("w2v2_config", {}))
         config.num_hidden_layers = kwargs.get("encoder_depth", 12)
         config.hidden_size = kwargs.get("encoder_dim", 1024)
-        if cond_pooling not in {"mean", "cls"}:
+        if cond_pooling not in COND_POOLINGS:
             raise ValueError(
-                f"cond_pooling must be 'mean' or 'cls', got {cond_pooling!r}"
+                f"cond_pooling must be one of {COND_POOLINGS}, got {cond_pooling!r}"
             )
         self.cond_pooling = cond_pooling
         self.cond_loss_components = {}
@@ -116,6 +122,11 @@ class MLENModel(MuQModel):
         if cond_dim is not None:
             self.cond = True
             self.cond_proj = nn.Linear(kwargs["encoder_dim"], cond_target_dim)
+            if cond_pooling == "attention":
+                # One query per aspect; the shared cond_proj decodes each pooled vector.
+                self.aspect_pool = AspectAttentionPool(
+                    cond_dim, kwargs["encoder_dim"], num_heads=cond_pool_heads
+                )
             self.cond_loss = self.resolve_cond_loss(cond_loss)
             if cond_label_weights is not None and not self.cond_loss_is_per_sample:
                 raise ValueError(f"cond_label_weights need a per-sample loss, not {cond_loss!r}")
@@ -322,16 +333,29 @@ class MLENModel(MuQModel):
             self.rvq_loss_components[f"{key}_codebook{i}_loss"] = per_row[:, i].mean().detach()
             self.rvq_loss_components[f"{key}_codebook{i}_acc"] = correct[:, i].mean().detach()
     
+    @staticmethod
+    def _frame_attention_mask(attention_mask, num_frames):
+        """Subsample a sample-level attention mask to frames (True = keep)."""
+        attention_mask = attention_mask.bool()
+        skip_n = int(attention_mask.size(-1) / num_frames)
+        return attention_mask[:, ::skip_n][:, :num_frames]
+
     def get_cond_prediction(self, last_hidden_emb, attention_mask):
+        """Normalised predictions: [B, D] for mean/cls, [B, A, D] for attention."""
         if self.cond_pooling == "cls":
             cond_pred = self.cond_proj(last_hidden_emb[:, 0])
             return F.normalize(cond_pred, p=2, dim=-1)
 
+        if self.cond_pooling == "attention":
+            frames = last_hidden_emb
+            key_padding_mask = None
+            if attention_mask is not None:
+                key_padding_mask = ~self._frame_attention_mask(attention_mask, frames.size(1))
+            pooled = self.aspect_pool(frames, key_padding_mask)
+            return F.normalize(self.cond_proj(pooled), p=2, dim=-1)
+
         if attention_mask is not None:
-            attention_mask = attention_mask.bool()
-            skip_n = int(attention_mask.size(-1) / last_hidden_emb.size(1))
-            attention_mask = attention_mask[:, ::skip_n]
-            attention_mask = attention_mask[:, :last_hidden_emb.size(1)]
+            attention_mask = self._frame_attention_mask(attention_mask, last_hidden_emb.size(1))
 
             frame_mask = attention_mask.unsqueeze(-1).float()
             cond_pred = self.cond_proj(last_hidden_emb)
@@ -382,21 +406,29 @@ class MLENModel(MuQModel):
             losses["recon_loss"] = self.get_recon_loss(frame_hidden, melspec, masked_indices) * self.recon_loss_ratio
         
         if self.cond:
-            aspect_ids = condition_to_aspect_ids(args[0])
             assert cond_label is not None, "cond_label is required for MLENModel in conditional mode"
+            pair_rows, aspect_ids, pair_target, pair_index = self._cond_pairs(
+                args[0], cond_label, cond_label_index
+            )
             cond_pred = self.get_cond_prediction(hidden_emb[-1], attention_mask)
-            loss_args = (cond_pred, cond_label, aspect_ids, logits, target_tokens, masked_indices)
+            if cond_pred.dim() == 2:
+                # One vector per track serves every pair of that track.
+                cond_pred = cond_pred[pair_rows]
+            else:
+                cond_pred = cond_pred[pair_rows, aspect_ids.clamp_min(0)]
+            loss_args = (cond_pred, pair_target, aspect_ids, logits, target_tokens, masked_indices)
             loss_kwargs = dict(
                 target_aspect=1, cond_weighting=50,
                 aspect_means=self.aspect_whitening_means,
                 whitening_matrices=self.aspect_whitening_matrices,
+                pair_rows=pair_rows,
                 # Losses that report branch values write into this dict.
                 components=self.cond_loss_components,
             )
             loss_kwargs.update(self.cond_loss_kwargs)
             if self.cond_loss_is_per_sample:
                 per_sample = self.cond_loss(*loss_args, reduction="none", **loss_kwargs)
-                sample_weights = self.get_cond_sample_weights(cond_label_index, per_sample)
+                sample_weights = self.get_cond_sample_weights(pair_index, per_sample)
                 if sample_weights is None:
                     losses['cond_loss'] = per_sample.sum() / max(per_sample.numel(), 1)
                 else:
@@ -406,9 +438,47 @@ class MLENModel(MuQModel):
             else:
                 losses['cond_loss'] = self.cond_loss(*loss_args, **loss_kwargs)
                 self.cond_loss_per_sample = None
+            # One entry per (track, aspect) pair, for logging and validation plots.
             self.cond_aspect_ids = aspect_ids.detach()
+            self.cond_pair_rows = pair_rows.detach()
+            self.cond_pred = cond_pred.detach()
+            self.cond_pair_target = pair_target.detach()
 
         return logits, hidden_emb, losses, accuracies
+
+    def _cond_pairs(self, cond, cond_label, cond_label_index):
+        """Supervised (track, aspect) pairs: rows, aspect ids, targets, label indices.
+
+        cond_label [B, D] (one aspect per track): the aspect is the cond's
+        argmax, or -1 for an all-zero cond; pairs are the rows themselves.
+        cond_label [B, A, D] (a target for every aspect): the pairs are the
+        nonzero entries of the multi-hot cond. Tracks whose cond is all zero
+        become aspect -1 pairs with a zero target when the cond loss has a
+        term for unconditional tracks, and are left out otherwise.
+        """
+        if cond_label.dim() == 2:
+            rows = torch.arange(cond.size(0), device=cond.device)
+            return rows, condition_to_aspect_ids(cond), cond_label, cond_label_index
+        if cond_label.dim() != 3 or cond_label.shape[:2] != cond.shape:
+            raise ValueError(
+                "cond_label must be [B, D] or [B, A, D] matching the [B, A] cond, got "
+                f"{tuple(cond_label.shape)} for cond {tuple(cond.shape)}"
+            )
+        rows, aspect_ids = cond.nonzero(as_tuple=True)
+        if self.cond_loss_handles_unconditional:
+            unconditional = cond.eq(0).all(dim=-1).nonzero(as_tuple=True)[0]
+            rows = torch.cat([rows, unconditional])
+            aspect_ids = torch.cat([aspect_ids, torch.full_like(unconditional, -1)])
+        lookup = aspect_ids.clamp_min(0)
+        conditional = aspect_ids >= 0
+        target = cond_label[rows, lookup].masked_fill(~conditional.unsqueeze(-1), 0)
+        index = None
+        if cond_label_index is not None:
+            index = torch.as_tensor(cond_label_index, device=cond.device).long()
+            index = index[rows, lookup].masked_fill(~conditional, -1)
+            if (conditional & (index < 0)).any():
+                raise ValueError("cond activates an aspect the track has no target for")
+        return rows, aspect_ids, target, index
 
     def get_cond_sample_weights(self, cond_label_index, per_sample):
         """Per-sample weights from the label table, or None when unweighted."""
@@ -424,6 +494,10 @@ class MLENModel(MuQModel):
     @property
     def cond_loss_is_per_sample(self):
         return getattr(self.cond_loss, "__name__", None) in PER_SAMPLE_COND_LOSSES
+
+    @property
+    def cond_loss_handles_unconditional(self):
+        return getattr(self.cond_loss, "__name__", None) in UNCONDITIONAL_COND_LOSSES
 
     def raw_centered_cosine_loss(self, pred, target, aspect_ids, *args, **kwargs):
         if self.aspect_centroids is None or self.centroid_weight == 0.0:

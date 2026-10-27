@@ -1,5 +1,7 @@
 import os
+import re
 import argparse
+from time import perf_counter
 
 import torch
 import pytorch_lightning as pl
@@ -14,6 +16,7 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from mlen.modules import MLEN, MLENConfig
 from mlen.datasets import MLENDatamodule
+from mlen.datasets.target_store import load_target_statistics, resolve_training_metadata
 
 
 
@@ -21,12 +24,35 @@ def get_logger(save_dir: str, run_name: Optional[str] = None) -> WandbLogger:
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
+    name = run_name or save_path.name
     return WandbLogger(
         project="MLEN-OneHot-RVQ",
-        name=run_name or save_path.name,
+        name=name,
+        # A run id derived from the run name lets a resumed job continue the
+        # same W&B run instead of opening a new one on every restart.
+        id=re.sub(r"[^A-Za-z0-9_.-]", "-", name),
+        resume="allow",
         save_dir=str(save_path),
         log_model=False,
     )
+
+
+def describe_checkpoint(path):
+    """Return (epoch, global_step) of a Lightning checkpoint.
+
+    Reads the file through mmap so a 4 GB checkpoint costs no RAM, and fails
+    here with a clear message if the file is truncated or unreadable instead
+    of deep inside trainer.fit().
+    """
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    except Exception as error:
+        raise RuntimeError(f"Resume checkpoint {path} is unreadable: {error}") from error
+    epoch, step = checkpoint.get("epoch"), checkpoint.get("global_step")
+    del checkpoint
+    if step is None:
+        raise RuntimeError(f"Resume checkpoint {path} has no global_step; not a Trainer checkpoint.")
+    return epoch, step
 
 
 def cast_dataclass(obj, target_cls):
@@ -99,9 +125,10 @@ def freeze_unused_parameters(mlen):
 
 def load_whitening_statistics(metadata_path):
     """Read the two fixed loss tensors without retaining the full metadata."""
-    metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
+    statistics = load_target_statistics(metadata_path, "aspect_whitening")
     try:
-        statistics = metadata["target_statistics"]["aspect_whitening"]
+        if statistics is None:
+            raise KeyError("aspect_whitening")
         means = torch.as_tensor(statistics["means"], dtype=torch.float32)
         matrices = torch.as_tensor(
             statistics["whitening_matrices"], dtype=torch.float32
@@ -116,8 +143,7 @@ def load_whitening_statistics(metadata_path):
 
 def load_label_weights(metadata_path):
     """Per-label cond-loss weights from the label-weight setup cell, or None if absent."""
-    metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
-    record = metadata.get("target_statistics", {}).get("label_weights")
+    record = load_target_statistics(metadata_path, "label_weights")
     if record is None:
         return None
     weights = torch.as_tensor(record["weights"], dtype=torch.float32)
@@ -134,6 +160,8 @@ def main():
     parser.add_argument("-c", "--config", dest="config", type=str, default=None)
     parser.add_argument("--ckpt", dest="ckpt", type=str, default=None)
     parser.add_argument("-m", "--meta_path", dest="meta_path", type=str, default=None)
+    parser.add_argument("--targets-path", type=Path, default=None,
+                        help="Migrated target directory or manifest; defaults to META_PATH/targets when present")
     parser.add_argument("-d", "--data_path", dest="data_path", type=str, default=None)
     parser.add_argument("-l", "--log_dir", dest="log_dir", type=str, default=None)
     parser.add_argument("--val_split_fraction", dest="val_split_fraction", type=float, default=0.0)
@@ -146,33 +174,50 @@ def main():
     )
     parser.add_argument(
         "--cond-pooling",
-        choices=("mean", "cls"),
+        choices=("mean", "cls", "attention"),
         default="mean",
-        help="Pooling used for the conditional prediction head.",
+        help=(
+            "Pooling used for the conditional prediction head; 'attention' pools "
+            "once per aspect and is required for the 'multi' and 'all' cond policies."
+        ),
     )
     args = parser.parse_args()
 
     os.environ.setdefault("MASTER_PORT", "29501")
     train_name = os.environ.get("TRAIN_NAME", "test-run")
+    if args.ckpt:
+        epoch, step = describe_checkpoint(args.ckpt)
+        print(f"Resuming from {args.ckpt} (epoch={epoch}, global_step={step})")
  
     script_dir = Path(__file__).resolve().parent
-    meta_path = Path(args.meta_path) or script_dir / "meta"
-    data_path = Path(args.data_path) or script_dir / "data"
-    log_path = Path(args.log_dir) or script_dir / "logs"
+    meta_path = Path(args.meta_path) if args.meta_path else script_dir / "meta"
+    data_path = Path(args.data_path) if args.data_path else script_dir / "data"
+    log_path = Path(args.log_dir) if args.log_dir else script_dir / "logs"
+    train_meta_path, target_statistics_path = resolve_training_metadata(meta_path, args.targets_path)
+    print(f"Training targets selected: {train_meta_path}", flush=True)
 
+    model_started = perf_counter()
+    print("Loading pretrained MuQ model...", flush=True)
     muq = MuQ.from_pretrained("OpenMuQ/MuQ-large-msd-iter")
+    print(f"Loaded pretrained MuQ model in {perf_counter() - model_started:.2f} s", flush=True)
     config = muq.config
     config = cast_dataclass(config, MLENConfig)
     config.cond_target_dim = 512
     config.cond_loss_weight = 1.
     config.rvq_loss_weight = 0.
     config.cond_dim = 8 
-    config.cond_pooling = 'mean'
+    config.cond_pooling = args.cond_pooling
     # config.cond_loss = "whitened_cosine_similarity_loss"
     config.cond_loss = "whitened_or_rvq_loss"
-    # Probability of replacing a training sample's aspect by the zero
-    # (unconditional) condition; validation never drops. 
-    aspect_dropout = 0.1
+    # Which of a track's available aspects condition it in training: "single"
+    # (one random aspect, as before), "multi" (random subset), "all". Multi-
+    # aspect conds need cond_pooling "attention" to get one prediction per aspect.
+    config.cond_policy = "single"
+    # Probability that a training track gets the all-zero (unconditional) cond;
+    # pair with cond_loss = "whitened_or_rvq_loss" and rvq_loss_weight = 0.
+    config.cond_drop_prob = 0.0
+    # Validation cond: a fixed function of the track id, never dropped.
+    config.cond_val_policy = "single"
     # Weights inside the cond loss. For whitened_or_rvq_loss, e.g.
     # {"whitening_weight": 1.0, "rvq_weight": 1.0, "rvq_aspects": (-1,)};
     # with that loss also set rvq_loss_weight = 0 so RVQ is not counted twice.
@@ -187,8 +232,6 @@ def main():
     )
 
     # Only whitened_* cond losses require whitening statistics.
-    target_statistics_path = meta_path / "track_metadata_with_centroids.pt"
-
     (
         config.aspect_whitening_means,
         config.aspect_whitening_matrices,
@@ -227,7 +270,7 @@ def main():
     print(f"Loaded weights with {len(missing)} missing keys, {len(unexpected)} unexpected keys, and {len(skipped)} skipped keys.")
     datamodule = MLENDatamodule(
         root_path=data_path,
-        train_meta_path=str(meta_path / "track_metadata.pt"),
+        train_meta_path=str(train_meta_path),
         train_label_paths=[
             str(meta_path / f"latentrvq_label.codebook{i}.txt") for i in range(8)
         ],
@@ -239,7 +282,6 @@ def main():
         warn_on_label_length_mismatch=False,
         val_split_fraction=args.val_split_fraction,
         val_split_seed=args.val_split_seed,
-        train_aspect_dropout=aspect_dropout,
         num_workers=4,
         persistent_workers=True,
         prefetch_factor=2,
@@ -272,7 +314,11 @@ def main():
         benchmark=True,
         val_check_interval=1000,
     )
-    trainer.fit(mlen, datamodule)
+    # ckpt_path=None starts from scratch; otherwise Lightning restores the
+    # weights, optimizer, LR schedule, epoch and global step from the file.
+    # weights_only=False: our own checkpoints pickle MLENConfig in
+    # hyper_parameters, which torch>=2.6's default strict unpickler rejects.
+    trainer.fit(mlen, datamodule, ckpt_path=args.ckpt, weights_only=False)
 
     trainer.save_checkpoint(
         str(log_path / "checkpoints" / "final.ckpt"),

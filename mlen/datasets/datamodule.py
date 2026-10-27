@@ -5,10 +5,10 @@ from typing import Optional
 import torch
 from pytorch_lightning import LightningDataModule
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from torch.nn.utils.rnn import pad_sequence
 
-from .datasets import AspectDropoutView, AudioTextRVQDataset
+from .datasets import AudioTextRVQDataset
 
 
 @dataclass
@@ -230,9 +230,12 @@ class AudioTextRVQCollator:
             "source": torch.stack(sources),
             "padding_mask": torch.stack(padding_masks),
             "audio_starts": torch.LongTensor(starts),
-            "aspect_cond": torch.stack([sample["aspect_cond"] for sample in samples]),
+            # [B, A, D] targets and [B, A] label indices for every aspect; -1
+            # marks an aspect the track lacks. The condition is sampled later.
             "aspect_target": torch.stack([sample["aspect_target"] for sample in samples]),
-            "text_index": torch.LongTensor([int(sample.get("text_index", -1)) for sample in samples]),
+            "text_index": torch.stack([
+                torch.as_tensor(sample["text_index"], dtype=torch.long) for sample in samples
+            ]),
             # "aspect_class_id": aspect_class_ids,
             # "aspect_class_mask": aspect_class_ids.ne(-1),
         }
@@ -265,7 +268,6 @@ class AudioTextRVQCollator:
             batch["net_input"] = {
                 "source": batch["source"],
                 "padding_mask": batch["padding_mask"],
-                "aspect_cond": batch["aspect_cond"],
             }
             batch["net_input_target"] = batch["aspect_target"]
 
@@ -305,13 +307,10 @@ class MLENDataModule(LightningDataModule):
         val_split_fraction: float = 0.0,
         val_split_seed: int = 0,
         prefetch_factor: int = 2,
-        train_aspect_dropout: float = 0.0,
     ):
         super().__init__()
         if not 0.0 <= val_split_fraction < 1.0:
             raise ValueError("val_split_fraction must be in the range [0.0, 1.0).")
-        if not 0.0 <= train_aspect_dropout <= 1.0:
-            raise ValueError("train_aspect_dropout must be in the range [0.0, 1.0].")
 
         self.root_path = root_path
         self.meta_paths = {
@@ -334,8 +333,6 @@ class MLENDataModule(LightningDataModule):
         self.drop_last = drop_last
         self.val_split_fraction = val_split_fraction
         self.val_split_seed = val_split_seed
-        # Training only; validation and test never drop aspects.
-        self.train_aspect_dropout = train_aspect_dropout
 
         self.dataset_kwargs = {
             "sample_rate": sample_rate,
@@ -391,7 +388,6 @@ class MLENDataModule(LightningDataModule):
             root_path=self.root_path,
             meta_path=meta_path,
             label_paths=self.label_paths[split],
-            aspect_dropout=self.train_aspect_dropout if split == "train" else 0.0,
             **self.dataset_kwargs,
         )
 
@@ -421,12 +417,6 @@ class MLENDataModule(LightningDataModule):
             train_dataset,
             [train_size, val_size],
             generator=generator,
-        )
-        # The split shares the training dataset's metadata and labels, so
-        # re-point the validation indices at a view without aspect dropout.
-        val_subset = Subset(
-            AspectDropoutView(train_dataset, aspect_dropout=0.0),
-            val_subset.indices,
         )
         return train_subset, val_subset
 

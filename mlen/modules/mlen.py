@@ -15,6 +15,7 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from ..models import MLENModel
 from ..models.gradient_monitor import aspect_gradient_statistics
 from ..models.utils import cosine_similarity_loss, condition_to_aspect_ids
+from .cond_policy import COND_POLICIES, sample_cond
 
 @dataclass
 class MLENConfig:
@@ -43,7 +44,18 @@ class MLENConfig:
     rvq_multi_layer_num:int = field(default=1)
     cond_dim: Optional[int] = field(default=8)
     cond_target_dim: Optional[int] = field(default=512)
+    # "mean" or "cls" give one prediction per track; "attention" pools once
+    # per aspect with learned queries and is required for multi-aspect conds.
     cond_pooling: str = field(default="mean")
+    cond_pool_heads: int = field(default=8)
+    # Which of a track's available aspects condition it during training:
+    # "single" (one random aspect), "multi" (random subset of 1..n), "all".
+    cond_policy: str = field(default="single")
+    # Probability that a training track gets the all-zero (unconditional)
+    # cond instead; pair with cond_loss = "whitened_or_rvq_loss".
+    cond_drop_prob: float = field(default=0.0)
+    # Validation policy; a fixed function of the track id, never dropped.
+    cond_val_policy: str = field(default="single")
     # Name of a loss in mlen.models.mlen_model.COND_LOSSES, or "raw_centered_cosine_loss".
     cond_loss: str = field(default="cosine_similarity_loss")
     cond_loss_weight: Optional[float] = field(default=1.0)
@@ -104,7 +116,16 @@ class MLEN(LightningModule):
             aspect_whitening_matrices=config.aspect_whitening_matrices,
             cond_label_weights=config.cond_label_weights,
             cond_loss_kwargs=config.cond_loss_kwargs,
+            cond_pool_heads=config.cond_pool_heads,
         )
+        for name in ("cond_policy", "cond_val_policy"):
+            if getattr(config, name) not in COND_POLICIES:
+                raise ValueError(f"{name} must be one of {COND_POLICIES}, got {getattr(config, name)!r}")
+        if not 0.0 <= config.cond_drop_prob <= 1.0:
+            raise ValueError("cond_drop_prob must be in the range [0.0, 1.0]")
+        self.cond_policy = config.cond_policy
+        self.cond_drop_prob = config.cond_drop_prob
+        self.cond_val_policy = config.cond_val_policy
         self.rvq_loss_weight = config.rvq_loss_weight
         self.cond_loss_weight = config.cond_loss_weight 
         self.log_cond_grad_norms = config.log_cond_grad_norms
@@ -143,6 +164,43 @@ class MLEN(LightningModule):
             x, *args, attention_mask=attention_mask, label=label, cond_label=cond_label, feature_only=feature_only,
             aspect_class_id=aspect_class_id, cond_label_index=cond_label_index,
         )
+
+    def _batch_cond(self, batch, *, training):
+        """The [B, A] cond for a batch: given explicitly, or sampled per policy.
+
+        Batches from AudioTextRVQDataset carry no cond; the active aspects are
+        drawn here from text_index, randomly in training and as a fixed
+        function of the track id in validation.
+        """
+        cond = batch.get('aspect_cond', None)
+        if cond is not None or not self.model.cond:
+            return cond
+        available = batch['text_index'] >= 0
+        if training:
+            return sample_cond(available, self.cond_policy, drop_prob=self.cond_drop_prob)
+        return sample_cond(available, self.cond_val_policy, ids=batch.get('id', None))
+
+    @torch.no_grad()
+    def predict_aspects(self, x, cond, padding_mask=None):
+        """Normalised predictions [B, A, D] for the aspects active in ``cond``.
+
+        One encoder pass per track serves every active aspect; inactive
+        aspects are zero. With mean or cls pooling every active aspect of a
+        track receives the same vector.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        dtype = torch.bfloat16 if self.flash_attention else torch.float32
+        try:
+            with torch.autocast(device_type=x.device.type, dtype=dtype):
+                attention_mask = self._padding_to_attention_mask(padding_mask)
+                _, hidden_emb = self.model(x, cond, attention_mask=attention_mask, feature_only=True)
+                prediction = self.model.get_cond_prediction(hidden_emb[-1], attention_mask)
+        finally:
+            self.model.train(was_training)
+        if prediction.dim() == 2:
+            prediction = prediction.unsqueeze(1).expand(-1, cond.size(1), -1)
+        return prediction.float() * cond.ne(0).unsqueeze(-1).to(prediction.device)
 
     def extract_features(
         self,
@@ -187,7 +245,7 @@ class MLEN(LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch['source']
         batch_size = x.size(0)
-        cond = batch.get('aspect_cond', None)
+        cond = self._batch_cond(batch, training=True)
         padding_mask = batch.get('padding_mask', None)
         label = batch.get('target', None)
         cond_label = batch.get('aspect_target', None)
@@ -267,14 +325,24 @@ class MLEN(LightningModule):
     def _record_cond_gradients(self, hidden, target, cond, padding_mask):
         if not self.log_cond_grad_norms or self.model.cond_loss is not cosine_similarity_loss:
             return
+        if self.model.cond_pooling not in ("mean", "cls"):
+            return  # The monitor models the linear head over a per-track pooling only.
+        attention_mask = self._padding_to_attention_mask(padding_mask)
+        rows = getattr(self.model, "cond_pair_rows", None)
+        if rows is None:
+            aspect_ids = condition_to_aspect_ids(cond)
+        else:
+            # One entry per (track, aspect) pair, as the loss saw them.
+            hidden, target, aspect_ids = hidden[rows], self.model.cond_pair_target, self.model.cond_aspect_ids
+            attention_mask = None if attention_mask is None else attention_mask[rows]
         statistics = aspect_gradient_statistics(
             self.model.cond_proj, 
             hidden, 
             target, 
-            condition_to_aspect_ids(cond),
+            aspect_ids,
             self._cond_grad_interval.size(0), 
             pooling=self.model.cond_pooling,
-            attention_mask=self._padding_to_attention_mask(padding_mask),
+            attention_mask=attention_mask,
             loss_weight=self.cond_loss_weight,
         )
         self._cond_grad_interval += statistics.cpu()
@@ -341,20 +409,30 @@ class MLEN(LightningModule):
     def validation_step(self, batch, batch_idx):
         x = batch['source']
         batch_size = x.size(0)
-        cond = batch.get('aspect_cond', None)
+        cond = self._batch_cond(batch, training=False)
         padding_mask = batch.get('padding_mask', None)
         label = batch.get('target', None)
         cond_label = batch.get('aspect_target', None)
         class_id = batch.get('aspect_class_id', None)
         logits, hidden_emb, losses, accuracies = self(x, cond, padding_mask=padding_mask, label=label, cond_label=cond_label, aspect_class_id=class_id, feature_only=False, cond_label_index=batch.get('text_index', None))
-        output = {
-            "cond_target": cond_label.detach().float().cpu(),
-            "aspect_id": condition_to_aspect_ids(cond).detach().long().cpu(),
-        }
+        output = {}
         if 'cond_loss' in losses:
-            attention_mask = self._padding_to_attention_mask(padding_mask)
-            cond_pred = self.model.get_cond_prediction(hidden_emb[-1], attention_mask)
-            output["cond_pred"] = cond_pred.detach().float().cpu()
+            if getattr(self.model, "cond_pair_rows", None) is not None:
+                # One entry per (track, aspect) pair, exactly as the loss saw them.
+                output = {
+                    "cond_target": self.model.cond_pair_target.float().cpu(),
+                    "aspect_id": self.model.cond_aspect_ids.long().cpu(),
+                    "cond_pred": self.model.cond_pred.float().cpu(),
+                }
+            else:
+                # Models without pair bookkeeping: one aspect per track.
+                attention_mask = self._padding_to_attention_mask(padding_mask)
+                cond_pred = self.model.get_cond_prediction(hidden_emb[-1], attention_mask)
+                output = {
+                    "cond_target": cond_label.detach().float().cpu(),
+                    "aspect_id": condition_to_aspect_ids(cond).detach().long().cpu(),
+                    "cond_pred": cond_pred.detach().float().cpu(),
+                }
             self._accumulate_cond_losses(getattr(self, "_valid_cond_loss_interval", None))
             losses['cond_loss'] *= self.cond_loss_weight
         if 'melspec_2048' in losses:
@@ -375,7 +453,8 @@ class MLEN(LightningModule):
             )
         for name, value in getattr(self.model, "rvq_loss_components", {}).items():
             self.log(f"valid/rvq_{name}", value, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch_size)
-        self.validation_outputs.append(output)
+        if output:
+            self.validation_outputs.append(output)
         return output
 
     def on_validation_epoch_end(self):

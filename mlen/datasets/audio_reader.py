@@ -2,6 +2,7 @@
 
 import io
 import os
+from urllib.parse import urlparse
 
 import boto3
 import numpy as np
@@ -53,11 +54,14 @@ class AudioReader:
         return self._client
 
     def read(self, file_path: str) -> tuple[np.ndarray, int]:
-        if self.location != "S3":
+        uri = urlparse(str(file_path)) if str(file_path).startswith("s3://") else None
+        if self.location != "S3" and uri is None:
             return sf.read(file_path)
 
         client = self._get_client()
+        bucket = uri.netloc if uri is not None else self.bucket
+        key = uri.path.lstrip("/") if uri is not None else file_path
         with io.BytesIO() as file_buffer:
-            client.download_fileobj(self.bucket, file_path, file_buffer)
+            client.download_fileobj(bucket, key, file_buffer)
             file_buffer.seek(0)
             return sf.read(file_buffer)

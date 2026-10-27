@@ -1,5 +1,6 @@
 import logging
 import os
+from time import perf_counter
 import numpy as np
 import torch
 import torchaudio
@@ -8,6 +9,7 @@ from torch.utils.data import Dataset
 from torch.nn import functional as F
 
 from .audio_reader import AudioReader
+from .target_store import load_metadata
 from .utils import load_audio, load_label_offset, verify_label_lengths
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -28,16 +30,20 @@ class AudioTextRVQDataset(Dataset):
             normalize=False,
             label_processors=None,
             warn_on_label_length_mismatch=True,
-            aspect_dropout=0.0,
         ):
-        if not 0.0 <= aspect_dropout <= 1.0:
-            raise ValueError("aspect_dropout must be in the range [0.0, 1.0]")
-        meta_data = torch.load(meta_path)
+        metadata_started = perf_counter()
+        meta_data = load_metadata(meta_path)
+        logger.info("Loaded target metadata from %s in %.2f s", meta_path, perf_counter() - metadata_started)
+        for track in meta_data['tracks']:
+            if track['size'] is None:
+                raise ValueError("Audio lengths are missing; migrate track_metadata.pt with recorded sizes")
+            if track.get('sample_rate', sample_rate) != sample_rate:
+                raise ValueError(f"Track {track['track_name']} has an incompatible sample rate")
 
         self.audio_root = root_path
         self.audio_reader = AudioReader()
         self.valid_tracks = load_audio(meta_data['tracks'], None, min_sample_size)
-        inds = [track['idx'] for track in self.valid_tracks]
+        inds = [track.get('source_row', track['idx']) for track in self.valid_tracks]
         self.sizes = [track['size'] for track in self.valid_tracks]
         tot = len(meta_data['tracks'])
         self.sample_rate = sample_rate
@@ -49,9 +55,6 @@ class AudioTextRVQDataset(Dataset):
         self.num_aspects = meta_data['num_aspects']
         self.normalize = normalize
         self.label_processors = label_processors
-        # Probability of replacing a sample's aspect by the unconditional
-        # (all-zero) condition; see get_item.
-        self.aspect_dropout = aspect_dropout
 
         self.num_labels = len(label_paths)
         if self.num_labels > 0:
@@ -67,10 +70,12 @@ class AudioTextRVQDataset(Dataset):
                 else label_codebook_counts
             )
             logger.info('preparing labels')
+            labels_started = perf_counter()
             self.label_paths = label_paths
             self.label_offsets_list = [
                 load_label_offset(p, inds, tot) for p in label_paths
             ]
+            logger.info("Indexed %d RVQ label files in %.2f s", self.num_labels, perf_counter() - labels_started)
             if warn_on_label_length_mismatch:
                 for label_path, label_rate, label_codebook_count in zip(
                     label_paths, self.label_rates, self.label_codebook_counts
@@ -95,41 +100,32 @@ class AudioTextRVQDataset(Dataset):
         return len(self.sizes)
 
     def __getitem__(self, index):
-        return self.get_item(index, aspect_dropout=self.aspect_dropout)
+        """Load one track with the targets of every aspect it has.
 
-    def get_item(self, index, aspect_dropout=0.0):
-        """Load one track with a random aspect.
-
-        With probability ``aspect_dropout`` the aspect is dropped: the
-        condition and target become all zeros and ``text_index`` is -1.
-        ``condition_to_aspect_ids`` maps the zero condition to aspect -1,
-        which losses such as whitened_or_rvq_loss treat as the unconditional
-        (RVQ-only) sample and which per-aspect logging and label weights skip.
+        Items carry no condition and no randomness: ``aspect_target`` is
+        [num_aspects, D] with zeros for aspects the track lacks, and
+        ``text_index`` is [num_aspects] with -1 for them. The training module
+        decides which aspects to activate (see mlen.modules.cond_policy).
         """
         item = None
         while item is None:
             try:
                 track = self.valid_tracks[index]
-                # aspect_idx = np.random.choice([0, 1, 1, 2, 3, 4, 5, 6, 7])
-                aspect_idx = torch.randint(0, len(track['aspect_indices']), (1,)).item()
-                # positions = (track["aspect_indices"] == 1).nonzero().flatten()
-                # aspect_idx = positions[0].item()
-
-                wav = self.get_audio(track['track_name'])
-                aspect_cond = self.aspect_embedding_table[track['aspect_indices'][aspect_idx]]
-                aspect_target = self.text_embedding_table[track['text_indices'][aspect_idx]]
+                wav = self.get_audio(track.get('audio_uri') or track['track_name'])
+                aspects = torch.as_tensor(track['aspect_indices'], dtype=torch.long)
+                texts = torch.as_tensor(track['text_indices'], dtype=torch.long)
+                aspect_target = self.text_embedding_table.new_zeros(
+                    self.num_aspects, self.text_embedding_table.size(1)
+                )
+                aspect_target[aspects] = self.text_embedding_table[texts]
                 # Index into text_embedding_table; used to look up per-label loss weights.
-                text_index = int(track['text_indices'][aspect_idx])
-                if aspect_dropout > 0.0 and torch.rand(()).item() < aspect_dropout:
-                    aspect_cond = torch.zeros_like(aspect_cond)
-                    aspect_target = torch.zeros_like(aspect_target)
-                    text_index = -1
+                text_index = torch.full((self.num_aspects,), -1, dtype=torch.long)
+                text_index[aspects] = texts
 
                 # aspect_class_id = track['aspect_class_ids'][track['aspect_indices'][aspect_idx]]
                 item = {
                     "id": index,
                     "source": wav,
-                    "aspect_cond": aspect_cond,
                     "aspect_target": aspect_target,
                     "text_index": text_index,
                 #    "aspect_class_id": aspect_class_id
@@ -144,7 +140,7 @@ class AudioTextRVQDataset(Dataset):
         return item
 
     def get_audio(self, track_name):
-        wav_path = os.path.join(self.audio_root, track_name)
+        wav_path = track_name if "://" in track_name else os.path.join(self.audio_root, track_name)
 
         wav, cur_sample_rate = self.audio_reader.read(wav_path)
         wav = torch.from_numpy(wav).float()
@@ -183,23 +179,3 @@ class AudioTextRVQDataset(Dataset):
             with torch.no_grad():
                 wav = F.layer_norm(wav, wav.shape)
         return wav
-
-
-class AspectDropoutView(Dataset):
-    """The same tracks as ``dataset`` with a different aspect dropout rate.
-
-    Lets a validation split carved out of the training dataset read the same
-    metadata and labels without the training-time aspect dropout.
-    """
-
-    def __init__(self, dataset: AudioTextRVQDataset, aspect_dropout: float = 0.0):
-        if not 0.0 <= aspect_dropout <= 1.0:
-            raise ValueError("aspect_dropout must be in the range [0.0, 1.0]")
-        self.dataset = dataset
-        self.aspect_dropout = aspect_dropout
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        return self.dataset.get_item(index, aspect_dropout=self.aspect_dropout)

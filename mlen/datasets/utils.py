@@ -26,6 +26,8 @@ def load_audio(tracks, max_keep, min_keep):
             track['idx'] = ind
             valid_tracks.append(track)
     sizes = [track['size'] for track in valid_tracks]
+    if not sizes:
+        raise ValueError("No audio tracks remain after length filtering")
     logger.info(
         (
             f"max_keep={max_keep}, min_keep={min_keep}, "

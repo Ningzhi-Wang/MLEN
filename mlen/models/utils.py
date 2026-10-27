@@ -578,71 +578,90 @@ def whitened_or_rvq_loss(
     rvq_weight=0.1,
     reduction="mean",
     eps=1e-6,
+    pair_rows=None,
     components=None,
     **kwargs,
 ):
-    """Per-sample loss: RVQ for rvq_aspects, whitened cosine for other samples.
+    """Per-pair loss: RVQ for rvq_aspects, whitened cosine for other pairs.
 
-    rvq_aspects: one aspect ID or a sequence of IDs; -1 is the zeroed
-    (unconditional) sample produced by aspect dropout.
+    Each of the N entries of ``prediction``, ``target`` and ``aspect_ids`` is
+    one (track, aspect) pair; ``pair_rows`` [N] gives the track (batch row)
+    of each pair and defaults to one pair per row. rvq_aspects: one aspect ID
+    or a sequence of IDs; -1 is the unconditional (all-zero cond) track.
     rvq_targets[key]: [B, T, K], already reshaped by get_loss().
 
-    Each sample's value is ``whitening_weight`` times its whitened cosine
-    distance, or ``rvq_weight`` times the cross-entropy averaged over its
-    masked positions and codebooks and summed over logits keys. An RVQ sample
-    without masked positions contributes zero. ``reduction="none"`` returns a
-    [B] tensor so MLEN can apply per-label weights and per-aspect logging;
-    ``"mean"`` divides by B, so the RVQ branch scales with the fraction of
-    RVQ samples in the batch; ``"sum"`` sums. When ``components`` is a dict it
-    receives the detached, unweighted mean of each branch under ``"whitened"``
-    and ``"rvq"`` (zero for an empty branch).
+    A whitened pair contributes ``whitening_weight`` times its whitened
+    cosine distance. An RVQ pair contributes ``rvq_weight`` times the
+    cross-entropy of its track, averaged over the track's masked positions
+    and codebooks and summed over logits keys; a track without masked
+    positions contributes zero. ``reduction="none"`` returns an [N] tensor so
+    MLEN can apply per-label weights and per-aspect logging; ``"mean"``
+    divides by N, so the RVQ branch scales with the fraction of RVQ pairs;
+    ``"sum"`` sums. When ``components`` is a dict it receives the detached,
+    unweighted mean of each branch under ``"whitened"`` and ``"rvq"`` (zero
+    for an empty branch).
     """
     if reduction not in {"none", "mean", "sum"}:
         raise ValueError(f"Unsupported reduction: {reduction}")
     aspect_ids = torch.as_tensor(
         aspect_ids, device=prediction.device, dtype=torch.long
     ).flatten()
-    batch = prediction.size(0)
-    if aspect_ids.numel() != batch:
+    num_pairs = prediction.size(0)
+    if aspect_ids.numel() != num_pairs:
         raise ValueError(
             "aspect_ids must contain one ID per sample, got "
-            f"{aspect_ids.numel()} IDs for batch size {batch}"
+            f"{aspect_ids.numel()} IDs for batch size {num_pairs}"
         )
+    if pair_rows is None:
+        pair_rows = torch.arange(num_pairs, device=prediction.device)
+    else:
+        pair_rows = torch.as_tensor(
+            pair_rows, device=prediction.device, dtype=torch.long
+        ).flatten()
+        if pair_rows.numel() != num_pairs:
+            raise ValueError("pair_rows must contain one row per sample")
     rvq_aspects = torch.as_tensor(
         rvq_aspects, device=prediction.device, dtype=torch.long
     ).flatten()
 
     use_rvq = torch.isin(aspect_ids, rvq_aspects)
-    whitening_rows = (~use_rvq).nonzero(as_tuple=True)[0]
-    zeros = prediction.new_zeros(batch, dtype=torch.float32)
+    whitening_pairs = (~use_rvq).nonzero(as_tuple=True)[0]
+    zeros = prediction.new_zeros(num_pairs, dtype=torch.float32)
 
-    # The helper handles an empty subset; never run it on RVQ rows, whose
+    # The helper handles an empty subset; never run it on RVQ pairs, whose
     # aspect id (-1) would silently select the last aspect's statistics.
     whitened = whitened_cosine_similarity_loss(
-        prediction[whitening_rows],
-        target[whitening_rows],
-        aspect_ids[whitening_rows],
+        prediction[whitening_pairs],
+        target[whitening_pairs],
+        aspect_ids[whitening_pairs],
         aspect_means=aspect_means,
         whitening_matrices=whitening_matrices,
         reduction="none",
         eps=eps,
     )
-    whitened_per_sample = zeros.index_put((whitening_rows,), whitened)
+    whitened_per_pair = zeros.index_put((whitening_pairs,), whitened)
 
-    # Keep masked positions belonging to RVQ-selected samples.
+    num_rows = (
+        next(iter(rvq_logits.values())).size(0) if rvq_logits else num_pairs
+    )
+    row_zeros = prediction.new_zeros(num_rows, dtype=torch.float32)
+    rvq_rows = torch.zeros(num_rows, dtype=torch.bool, device=prediction.device)
+    rvq_rows[pair_rows[use_rvq]] = True
+
+    # Keep masked positions belonging to tracks with an RVQ pair.
     positions = torch.as_tensor(
         masked_indices, device=prediction.device, dtype=torch.long
     ).reshape(-1, 2)
-    positions = positions[use_rvq[positions[:, 0]]]
+    positions = positions[rvq_rows[positions[:, 0]]]
     indices = tuple(positions.t())
     rows = positions[:, 0]
-    counts = zeros.index_add(0, rows, torch.ones_like(rows, dtype=torch.float32))
+    counts = row_zeros.index_add(0, rows, torch.ones_like(rows, dtype=torch.float32))
 
-    rvq_per_sample = zeros
+    rvq_per_row = row_zeros
     with torch.autocast(device_type=prediction.device.type, enabled=False):
         for key, logits in rvq_logits.items():
             # Preserve a zero gradient when this branch has no samples.
-            rvq_per_sample = rvq_per_sample + logits[..., :0].float().sum()
+            rvq_per_row = rvq_per_row + logits[..., :0].float().sum()
 
             if positions.size(0) == 0:
                 continue
@@ -666,23 +685,24 @@ def whitened_or_rvq_loss(
                 tokens[indices].reshape(-1).long(),
                 reduction="none",
             ).view(-1, num_codebooks).mean(dim=-1)
-            rvq_per_sample = rvq_per_sample.index_add(0, rows, position_losses)
-    rvq_per_sample = rvq_per_sample / counts.clamp_min(1.0)
+            rvq_per_row = rvq_per_row.index_add(0, rows, position_losses)
+    rvq_per_row = rvq_per_row / counts.clamp_min(1.0)
+    rvq_per_pair = rvq_per_row[pair_rows] * use_rvq.to(torch.float32)
 
     if components is not None:
         components["whitened"] = (
             whitened.detach().mean() if whitened.numel() else zeros.new_zeros(())
         )
         components["rvq"] = (
-            rvq_per_sample[use_rvq].detach().mean()
+            rvq_per_pair[use_rvq].detach().mean()
             if use_rvq.any() else zeros.new_zeros(())
         )
 
-    loss = whitening_weight * whitened_per_sample + rvq_weight * rvq_per_sample
+    loss = whitening_weight * whitened_per_pair + rvq_weight * rvq_per_pair
     if reduction == "sum":
         return loss.sum()
     if reduction == "mean":
-        return loss.sum() / max(batch, 1)
+        return loss.sum() / max(num_pairs, 1)
     return loss
 
 
